@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = "TEMPLATE_S_beam"
+__title__  = "TEMPLATE_S_beam3"
 __author__ = "Assem Khalelova"
 
 import os
@@ -18,7 +18,6 @@ from Autodesk.Revit.DB import (
     View,
     ViewSheet,
     Viewport,
-    ViewType,
     IndependentTag,
     OpenOptions,
     ModelPathUtils,
@@ -35,253 +34,890 @@ from Autodesk.Revit.DB import (
     FailureSeverity
 )
 
-app = __revit__.Application
+app   = __revit__.Application
 uidoc = __revit__.ActiveUIDocument
-doc = uidoc.Document
+doc   = uidoc.Document
 
-# --- Configuration ---
-FAMILY_NAME = "MAG_S_B_50_SLG23_KLZ_B"
-TYPE_NAME = "S120B"
+# TODO: fill in S beam family name, type name, template path and output folder
+FAMILY_NAME   = "MAG_S_B_50_SLG23_KLZ_B"
+TYPE_NAME     = "S120B"
 SINGLE_MODELS = r"X:\01_PROJECTS\01_ITALY\01_MAGNETTI\MG-2608-SD-AKNO FIORENZUOLA\04_Designs\3_SD_Structure\2_Beams"
 TEMPLATE_PATH = r"X:\01_PROJECTS\01_ITALY\01_MAGNETTI\MG-2608-SD-AKNO FIORENZUOLA\05_Model\Template\S_template.rvt"
-QTY_PARAM = "MAG_Conteggio"
-PREFIX_PARAM = "Prefix_Mark"
+QTY_PARAM     = "MAG_Conteggio"
+PREFIX_PARAM  = "Prefix_Mark"
 
-CROP_MARGIN_FT = 1.5
-MAX_VIEWPORT_WIDTH_MM = 260.0
-MAX_VIEWPORT_HEIGHT_MM = 180.0
-VIEW_SCALES = [10, 20, 25, 50, 75, 100, 125, 150, 200, 250, 500]
+# Crop + scale tuning — adjust for your sheet/title-block layout
+CROP_MARGIN_FT          = 1.0    # extra space around beam inside the crop (~30 cm)
+MAX_VIEWPORT_WIDTH_MM   = 240.0  # strict paper-width budget for main views
+MAX_VIEWPORT_HEIGHT_MM  = 200.0  # (unused by fit_views_to_beam; kept for reference)
+VIEW_PARALLEL_DOT       = 0.85   # |dot(view_dir, beam_axis)| above this = cross-section
+VIEW_SCALES             = [10, 20, 25, 50, 75, 100, 125, 150, 200, 250, 500]
 
 SKIP_PARAM_NAMES = {
-    "Family", "Family and Type", "Family Name", "Type Name", "Type Id", "Id",
-    "Category", "Design Option", "Edited by", "Workset", "Phase Created",
-    "Phase Demolished", "Reference Level", "Start Level Offset", "End Level Offset",
-    "Cross-Section Rotation", "Start Extension", "End Extension", "yz Justification",
-    "y Justification", "y Offset Value", "z Justification", "z Offset Value"
+    "Family",
+    "Family and Type",
+    "Family Name",
+    "Type",
+    "Type Name",
+    "Type Id",
+    "Id",
+    "Category",
+    "Design Option",
+    "Edited by",
+    "Workset",
+    "Phase Created",
+    "Phase Demolished",
+    "Reference Level",
+    "Start Level Offset",
+    "End Level Offset",
+    "Cross-Section Rotation",
+    "Start Extension",
+    "End Extension",
+    "yz Justification",
+    "y Justification",
+    "y Offset Value",
+    "z Justification",
+    "z Offset Value",
 }
 
-OST_FRAMING_ID = ElementId(BuiltInCategory.OST_StructuralFraming)
+OST_FRAMING_ID = int(BuiltInCategory.OST_StructuralFraming)
 
-# --- Forceful Failure Handler for Dimension Errors ---
+
+# ── Failure handler ─────────────────────────────────────────────────────────────
+
 class SilentFailureHandler(IFailuresPreprocessor):
     def PreprocessFailures(self, fa):
-        failures = fa.GetFailureMessages()
-        if not failures:
-            return FailureProcessingResult.Continue
-        
-        for f in failures:
-            severity = f.GetSeverity()
-            if severity == FailureSeverity.Warning:
-                fa.DeleteWarning(f)
-            elif severity == FailureSeverity.Error:
-                # This fixes the "Dimension reference invalid" block
-                if f.HasDefaultResolution():
-                    fa.ResolveFailure(f)
-                else:
+        for msg in fa.GetFailureMessages():
+            sev = msg.GetSeverity()
+            if sev == FailureSeverity.Warning:
+                fa.DeleteWarning(msg)
+            elif sev == FailureSeverity.Error:
+                try:
+                    fa.DeleteWarning(msg)
+                except:
                     try:
-                        fa.ResolveFailure(f)
+                        fa.ResolveFailure(msg)
                     except:
                         pass
-        # ProceedWithCommit tells Revit to force the changes through even if elements were deleted
-        return FailureProcessingResult.ProceedWithCommit
+        return FailureProcessingResult.Continue
 
-# --- Utility Functions ---
-def unlock_view(view):
-    if view.ViewTemplateId != ElementId.InvalidElementId:
-        view.ViewTemplateId = ElementId.InvalidElementId
+
+# ── Read params from source ─────────────────────────────────────────────────────
 
 def _read_param_value(p):
-    if p.Definition is None or not p.HasValue: return None
-    st = p.StorageType
-    if st == StorageType.String: return ("String", p.AsString() or "")
-    if st == StorageType.Integer: return ("Integer", p.AsInteger())
-    if st == StorageType.Double: return ("Double", p.AsDouble())
-    return None
+    if p.Definition is None:
+        return None
+    st  = p.StorageType
+    val = None
+    if st == StorageType.String:
+        val = p.AsString()
+        if val is None:
+            val = ""
+    elif st == StorageType.Integer:
+        val = p.AsInteger()
+    elif st == StorageType.Double:
+        val = p.AsDouble()
+    elif st == StorageType.ElementId:
+        return None
+    if val is None:
+        return None
+    return (str(st), val)
+
 
 def read_all_instance_params(element):
     data = {}
+
     for p in element.Parameters:
-        if p.IsReadOnly or p.Definition is None: continue
-        if p.Definition.Name in SKIP_PARAM_NAMES: continue
-        res = _read_param_value(p)
-        if res: data[p.Definition.Name] = res
-    symbol = element.Symbol
-    if symbol:
-        for p in symbol.Parameters:
-            if p.Definition.Name in SKIP_PARAM_NAMES or p.Definition.Name in data: continue
-            res = _read_param_value(p)
-            if res: data[p.Definition.Name] = res
+        if p.IsReadOnly or p.Definition is None:
+            continue
+        name = p.Definition.Name
+        if name in SKIP_PARAM_NAMES:
+            continue
+        result = _read_param_value(p)
+        if result is not None:
+            data[name] = result
+
+    try:
+        symbol = element.Symbol
+        if symbol is not None:
+            for p in symbol.Parameters:
+                if p.Definition is None:
+                    continue
+                name = p.Definition.Name
+                if name in SKIP_PARAM_NAMES:
+                    continue
+                if name in data:
+                    continue
+                result = _read_param_value(p)
+                if result is not None:
+                    data[name] = result
+    except:
+        pass
+
     return data
 
+
+def read_cut_length(element):
+    p = element.get_Parameter(BuiltInParameter.STRUCTURAL_FRAME_CUT_LENGTH)
+    if p is not None:
+        return p.AsDouble()
+    return None
+
+
+def _read_beam_value(element, param_name):
+    """Try instance params first, fall back to type (Symbol) params."""
+    p = element.LookupParameter(param_name)
+    if p is None and element.Symbol is not None:
+        p = element.Symbol.LookupParameter(param_name)
+    if p is None:
+        return None
+    st = p.StorageType
+    if st == StorageType.Double:
+        return p.AsDouble()
+    elif st == StorageType.String:
+        return p.AsString()
+    elif st == StorageType.Integer:
+        return p.AsInteger()
+    return None
+
+
+def read_volume_cls(element):
+    return _read_beam_value(element, "MC CLS Sheet - SLG22")
+
+
+def read_kg_totale(element):
+    return _read_beam_value(element, "KG TOTALE Sheet - SLG22")
+
+
 def read_proj_info(doc):
+    """Read project info params in their native storage types."""
     info = doc.ProjectInformation
     data = {}
     for name in ("MAG_Nome_Commesa", "MAG_Numero_Commesa", "MAG_Nome_Cantiere"):
         p = info.LookupParameter(name)
-        if p:
-            res = _read_param_value(p)
-            if res: data[name] = res
+        if p is None:
+            continue
+        st = p.StorageType
+        val = None
+        if st == StorageType.String:
+            val = p.AsString()
+        elif st == StorageType.Integer:
+            val = p.AsInteger()
+        elif st == StorageType.Double:
+            val = p.AsDouble()
+        if val is None or val == "":
+            continue
+        data[name] = (str(st), val)
     return data
 
+
+# ── Collect from selection ──────────────────────────────────────────────────────
+
 def collect_elements_by_mark_from_selection(doc, uidoc):
-    counts, reps, param_data, cut_lengths, volume_data, kg_data = {}, {}, {}, {}, {}, {}
+    counts      = {}
+    reps        = {}
+    param_data  = {}
+    cut_lengths = {}
+    volume_data = {}
+    kg_data     = {}
+
     selection = uidoc.Selection.GetElementIds()
-    if not selection: return counts, reps, param_data, cut_lengths, volume_data, kg_data
+    print("  Selection count: {}".format(len(list(selection))))
+
+    if not selection:
+        print("ERROR: No elements selected. Please select beams first.")
+        return counts, reps, param_data, cut_lengths, volume_data, kg_data
+
     for el_id in selection:
         el = doc.GetElement(el_id)
-        if not isinstance(el, FamilyInstance) or el.Category.Id != OST_FRAMING_ID: continue
+        if el is None:
+            continue
+
+        if not isinstance(el, FamilyInstance):
+            continue
+
+        try:
+            cat_id = el.Category.Id.IntegerValue
+            if cat_id != OST_FRAMING_ID:
+                continue
+        except:
+            continue
+
         prefix_p = el.LookupParameter(PREFIX_PARAM)
+        if prefix_p is None:
+            try:
+                fn = el.Symbol.Family.Name if el.Symbol else "?"
+                print("  SKIP: '{}' has no {} param".format(fn, PREFIX_PARAM))
+            except:
+                print("  SKIP: element has no {} param".format(PREFIX_PARAM))
+            continue
+
+        prefix = prefix_p.AsString() if prefix_p.AsString() else ""
+
         mark_p = el.get_Parameter(BuiltInParameter.ALL_MODEL_MARK)
-        prefix = prefix_p.AsString() if prefix_p and prefix_p.AsString() else ""
-        mark = mark_p.AsString() if mark_p and mark_p.AsString() else ""
+        mark   = mark_p.AsString() if mark_p and mark_p.AsString() else ""
+
         key = prefix + mark
         counts[key] = counts.get(key, 0) + 1
+
         if key not in reps:
             reps[key] = el
             param_data[key] = read_all_instance_params(el)
-            cl_p = el.get_Parameter(BuiltInParameter.STRUCTURAL_FRAME_CUT_LENGTH)
-            if cl_p: cut_lengths[key] = cl_p.AsDouble()
-            vol_p = el.LookupParameter("MC CLS Sheet - SLG22")
-            if vol_p: volume_data[key] = vol_p.AsDouble() if vol_p.StorageType == StorageType.Double else vol_p.AsString()
-            kg_p = el.LookupParameter("KG TOTALE Sheet - SLG22")
-            if kg_p: kg_data[key] = kg_p.AsDouble() if kg_p.StorageType == StorageType.Double else kg_p.AsString()
+            cl = read_cut_length(el)
+            if cl is not None:
+                cut_lengths[key] = cl
+            vol = read_volume_cls(el)
+            if vol is not None:
+                volume_data[key] = vol
+            kg = read_kg_totale(el)
+            if kg is not None:
+                kg_data[key] = kg
+
     return counts, reps, param_data, cut_lengths, volume_data, kg_data
 
-# --- Geometry Functions ---
-def set_beam_cut_length(target_el, desired_cut_length):
-    loc = target_el.Location
+
+# ── File handling ───────────────────────────────────────────────────────────────
+
+def create_from_template(template_path, dest_path):
+    dest_dir = os.path.dirname(dest_path)
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir)
+    shutil.copy2(template_path, dest_path)
+
+
+def open_document(filepath):
+    model_path = ModelPathUtils.ConvertUserVisiblePathToModelPath(filepath)
+    open_opts  = OpenOptions()
+    open_opts.DetachFromCentralOption = 0
+    return app.OpenDocumentFile(model_path, open_opts)
+
+
+# ── Core logic ──────────────────────────────────────────────────────────────────
+
+def find_existing_beam(target_doc, family_name, type_name):
+    all_beams = FilteredElementCollector(target_doc)\
+        .OfCategory(BuiltInCategory.OST_StructuralFraming)\
+        .OfClass(FamilyInstance)\
+        .ToElements()
+
+    print("  Template has {} structural framing elements.".format(len(all_beams)))
+
+    for el in all_beams:
+        try:
+            fn = el.Symbol.Family.Name
+            tn = el.Symbol.get_Parameter(BuiltInParameter.ALL_MODEL_TYPE_NAME).AsString()
+            if fn == family_name and tn == type_name:
+                return el
+        except:
+            continue
+
+    if all_beams:
+        try:
+            fn = all_beams[0].Symbol.Family.Name
+            tn = all_beams[0].Symbol.get_Parameter(
+                BuiltInParameter.ALL_MODEL_TYPE_NAME).AsString()
+            print("  Using fallback beam: '{}' : '{}'".format(fn, tn))
+        except:
+            print("  Using fallback beam.")
+        return all_beams[0]
+
+    return None
+
+
+def get_beam_endpoints(target_el):
+    loc   = target_el.Location
     curve = loc.Curve
-    start, end = curve.GetEndPoint(0), curve.GetEndPoint(1)
+    return curve.GetEndPoint(0), curve.GetEndPoint(1)
+
+
+def set_beam_cut_length(target_el, desired_cut_length):
+    loc   = target_el.Location
+    curve = loc.Curve
+    start = curve.GetEndPoint(0)
+    end   = curve.GetEndPoint(1)
     direction = (end - start).Normalize()
+
+    start_ext = 0.0
+    end_ext   = 0.0
     se_p = target_el.LookupParameter("Start Extension")
     ee_p = target_el.LookupParameter("End Extension")
-    s_ext = se_p.AsDouble() if se_p else 0.0
-    e_ext = ee_p.AsDouble() if ee_p else 0.0
-    needed_len = desired_cut_length - s_ext - e_ext
-    if needed_len < 0.01: needed_len = 0.01
-    new_end = start + direction.Multiply(needed_len)
-    loc.Curve = Line.CreateBound(start, new_end)
+    if se_p:
+        start_ext = se_p.AsDouble()
+    if ee_p:
+        end_ext = ee_p.AsDouble()
+
+    needed_curve_length = desired_cut_length - start_ext - end_ext
+    new_end  = start + direction.Multiply(needed_curve_length)
+    new_line = Line.CreateBound(start, new_end)
+    loc.Curve = new_line
+
 
 def reposition_tags_for_beam(target_doc, target_el, old_start, old_end, new_start, new_end):
-    old_len, new_len = old_end.DistanceTo(old_start), new_end.DistanceTo(new_start)
-    if old_len < 1e-7 or new_len < 1e-7: return
-    old_axis, new_axis = (old_end - old_start).Normalize(), (new_end - new_start).Normalize()
-    scale, target_val = new_len / old_len, target_el.Id.Value
-    tags = FilteredElementCollector(target_doc).OfClass(IndependentTag).ToElements()
-    for tag in tags:
-        try:
-            if any(tid.Value == target_val for tid in tag.GetTaggedLocalElementIds()):
-                head = tag.TagHeadPosition
-                offset = head - old_start
-                along = offset.DotProduct(old_axis)
-                perp = offset - old_axis.Multiply(along)
-                tag.TagHeadPosition = new_start + new_axis.Multiply(along * scale) + perp
-        except: continue
+    """
+    Reproject each tag head onto the new beam axis: preserve the perpendicular
+    offset, scale the along-axis distance by (new_length / old_length).
+    """
+    old_len = old_end.DistanceTo(old_start)
+    new_len = new_end.DistanceTo(new_start)
+    if old_len < 1e-9 or new_len < 1e-9:
+        return
 
-def expand_view_crops_for_beam(target_doc, b_start, b_end, margin=CROP_MARGIN_FT):
-    for view in FilteredElementCollector(target_doc).OfClass(View).ToElements():
-        if view.IsTemplate or not view.CropBoxActive: continue
-        unlock_view(view)
+    old_axis = (old_end - old_start).Normalize()
+    new_axis = (new_end - new_start).Normalize()
+    scale    = new_len / old_len
+
+    target_int = target_el.Id.IntegerValue
+    all_views  = FilteredElementCollector(target_doc).OfClass(View).ToElements()
+
+    moved   = 0
+    scanned = 0
+    for view in all_views:
+        try:
+            if view.IsTemplate:
+                continue
+        except:
+            continue
+
+        try:
+            tags = FilteredElementCollector(target_doc, view.Id)\
+                .OfClass(IndependentTag)\
+                .ToElements()
+        except:
+            continue
+
+        for tag in tags:
+            scanned += 1
+            try:
+                tagged_ids = list(tag.GetTaggedLocalElementIds())
+            except:
+                tagged_ids = []
+
+            hits = False
+            for tid in tagged_ids:
+                try:
+                    if tid.IntegerValue == target_int:
+                        hits = True
+                        break
+                except:
+                    continue
+            if not hits:
+                continue
+
+            try:
+                head   = tag.TagHeadPosition
+                offset = head - old_start
+                along  = offset.DotProduct(old_axis)
+                perp   = offset - old_axis.Multiply(along)
+
+                new_along = along * scale
+                new_head  = new_start + new_axis.Multiply(new_along) + perp
+
+                tag.TagHeadPosition = new_head
+                moved += 1
+            except Exception as e:
+                print("    Could not move tag {}: {}".format(tag.Id, e))
+
+    print("  Scanned {} tags, repositioned {}.".format(scanned, moved))
+
+
+def fit_views_to_beam(target_doc, beam_start, beam_end,
+                      max_w_mm=MAX_VIEWPORT_WIDTH_MM,
+                      margin_ft=CROP_MARGIN_FT,
+                      allowed_scales=VIEW_SCALES,
+                      parallel_dot=VIEW_PARALLEL_DOT):
+    """
+    For each non-template view with an active crop:
+      - if ViewDirection is ~parallel to the beam axis → cross-section, skip.
+      - otherwise: pick the smallest scale from allowed_scales that makes the
+        beam's projected length fit max_w_mm of paper; set view.Scale; then
+        rebuild the crop tight around the beam + margin on both axes.
+    """
+    max_w_ft = max_w_mm / 304.8
+
+    beam_vec = beam_end - beam_start
+    beam_len = beam_vec.GetLength()
+    if beam_len < 1e-9:
+        print("  fit_views_to_beam: beam length is zero, skipped.")
+        return
+    beam_axis = beam_vec.Normalize()
+
+    # Collect only views placed on a sheet as viewports — drafting templates,
+    # legends etc. are irrelevant and just add noise.
+    vps = FilteredElementCollector(target_doc).OfClass(Viewport).ToElements()
+    sheet_view_ids = set()
+    for vp in vps:
+        try:
+            sheet_view_ids.add(vp.ViewId.IntegerValue)
+        except:
+            pass
+
+    views = FilteredElementCollector(target_doc).OfClass(View).ToElements()
+
+    fitted      = 0
+    skipped_cx  = 0
+    skipped_oth = 0
+
+    for view in views:
+        try:
+            if view.IsTemplate:
+                continue
+            if view.Id.IntegerValue not in sheet_view_ids:
+                continue
+        except:
+            continue
+
+        try:
+            vn = view.Name
+        except:
+            vn = "?"
+
+        try:
+            vd = view.ViewDirection.Normalize()
+        except:
+            print("    '{}' has no ViewDirection, skipped.".format(vn))
+            skipped_oth += 1
+            continue
+
+        dp = abs(vd.X * beam_axis.X + vd.Y * beam_axis.Y + vd.Z * beam_axis.Z)
+        print("    '{}': dot={:.2f}, scale=1:{}, cropActive={}".format(
+            vn, dp, view.Scale, view.CropBoxActive))
+
+        if dp > parallel_dot:
+            skipped_cx += 1
+            continue
+
+        # Force crop ON so our bounds actually clip the view.
+        if not view.CropBoxActive:
+            try:
+                view.CropBoxActive = True
+                view.CropBoxVisible = False
+            except:
+                pass
+
         crop = view.CropBox
-        t_inv = crop.Transform.Inverse
-        p1, p2 = t_inv.OfPoint(b_start), t_inv.OfPoint(b_end)
-        mid_x, mid_y = (p1.X + p2.X)/2.0, (p1.Y + p2.Y)/2.0
-        dx, dy = abs(p2.X - p1.X), abs(p2.Y - p1.Y)
+        try:
+            t_inv = crop.Transform.Inverse
+        except:
+            print("    '{}': crop transform not invertible, skipped.".format(vn))
+            continue
+
+        p_start = t_inv.OfPoint(beam_start)
+        p_end   = t_inv.OfPoint(beam_end)
+
+        dx = abs(p_end.X - p_start.X)
+        dy = abs(p_end.Y - p_start.Y)
+        if max(dx, dy) < 0.01:
+            print("    '{}': beam projection ~zero in view plane, skipped.".format(vn))
+            continue
+
+        along_is_x   = dx >= dy
+        in_plane_len = dx if along_is_x else dy
+
+        current_scale = view.Scale
+        required      = in_plane_len / max_w_ft if max_w_ft > 0 else current_scale
+
+        target_s = None
+        for s in allowed_scales:
+            if s >= required:
+                target_s = s
+                break
+
+        if target_s is None:
+            print("    '{}' needs scale > {:.0f} — none in allowed list.".format(
+                vn, required))
+            target_s = current_scale
+
+        if target_s != current_scale:
+            try:
+                view.Scale = target_s
+                print("  Scale: '{}' 1:{} -> 1:{}".format(vn, current_scale, target_s))
+            except Exception as e:
+                print("    Could not rescale '{}' (template may lock Scale): {}".format(vn, e))
+
+        # Tight crop on BOTH axes — discard the old extent so nothing stays oversized.
+        a_start, a_end = (p_start.X, p_end.X) if along_is_x else (p_start.Y, p_end.Y)
+        o_start, o_end = (p_start.Y, p_end.Y) if along_is_x else (p_start.X, p_end.X)
+
+        a_min = min(a_start, a_end) - margin_ft
+        a_max = max(a_start, a_end) + margin_ft
+        o_min = min(o_start, o_end) - margin_ft
+        o_max = max(o_start, o_end) + margin_ft
+
+        if along_is_x:
+            new_min = XYZ(a_min, o_min, crop.Min.Z)
+            new_max = XYZ(a_max, o_max, crop.Max.Z)
+        else:
+            new_min = XYZ(o_min, a_min, crop.Min.Z)
+            new_max = XYZ(o_max, a_max, crop.Max.Z)
+
         new_bbox = BoundingBoxXYZ()
         new_bbox.Transform = crop.Transform
-        if dx >= dy:
-            new_bbox.Min = XYZ(mid_x - dx/2 - margin, crop.Min.Y, crop.Min.Z)
-            new_bbox.Max = XYZ(mid_x + dx/2 + margin, crop.Max.Y, crop.Max.Z)
-        else:
-            new_bbox.Min = XYZ(crop.Min.X, mid_y - dy/2 - margin, crop.Min.Z)
-            new_bbox.Max = XYZ(crop.Max.X, mid_y + dy/2 + margin, crop.Max.Z)
-        try: view.CropBox = new_bbox
-        except: pass
+        new_bbox.Min = new_min
+        new_bbox.Max = new_max
 
-def auto_adjust_view_scales(target_doc, beam_length_ft):
-    for vp in FilteredElementCollector(target_doc).OfClass(Viewport).ToElements():
-        view = target_doc.GetElement(vp.ViewId)
-        if not view or view.IsTemplate: continue
-        unlock_view(view)
-        if "ALTO" in view.Name.upper() or view.ViewType == ViewType.FloorPlan:
-            req_scale = (beam_length_ft * 304.8) / (MAX_VIEWPORT_WIDTH_MM * 0.85)
-            view.Scale = int(next((s for s in VIEW_SCALES if s >= req_scale), VIEW_SCALES[-1]))
-        sheet = target_doc.GetElement(vp.SheetId)
-        vp.SetBoxCenter(XYZ((sheet.Outline.Min.U + sheet.Outline.Max.U)/2.0, (sheet.Outline.Min.V + sheet.Outline.Max.V)/2.0, 0))
+        try:
+            view.CropBox = new_bbox
+            fitted += 1
+        except Exception as e:
+            print("    Could not resize crop on '{}': {}".format(vn, e))
 
-# --- Application Functions ---
-def apply_params(target_el, param_dict):
-    sym = target_el.Symbol
-    for name, (st, val) in param_dict.items():
-        p = target_el.LookupParameter(name)
-        if (p is None or p.IsReadOnly) and sym: p = sym.LookupParameter(name)
-        if p and not p.IsReadOnly:
-            try:
-                if st == "String": p.Set(str(val))
-                elif st == "Integer": p.Set(int(val))
-                elif st == "Double": p.Set(float(val))
-            except: continue
+    print("  Fitted {} views (skipped {} cross-sections, {} other).".format(
+        fitted, skipped_cx, skipped_oth))
 
-def process_mark(mark_key, qty, param_dict, cut_length, proj_data, vol, kg):
-    filepath = os.path.join(SINGLE_MODELS, mark_key + ".rvt")
-    if not os.path.exists(filepath):
-        if not os.path.exists(os.path.dirname(filepath)): os.makedirs(os.path.dirname(filepath))
-        shutil.copy2(TEMPLATE_PATH, filepath)
-    
-    single_doc = app.OpenDocumentFile(ModelPathUtils.ConvertUserVisiblePathToModelPath(filepath), OpenOptions())
+
+def _world_pt_to_paper(vp, view, world_pt):
+    """
+    Paper-space XY where world_pt falls inside this viewport's area on the sheet.
+    paper = vp_center + (point_in_crop_local - crop_center_local) / view.Scale
+    """
     try:
-        beams = FilteredElementCollector(single_doc).OfCategory(BuiltInCategory.OST_StructuralFraming).OfClass(FamilyInstance).ToElements()
-        target_el = next((b for b in beams if b.Symbol.Family.Name == FAMILY_NAME), beams[0] if beams else None)
-        if target_el:
-            with Transaction(single_doc, "Update Beam and Graphics") as t:
-                opts = t.GetFailureHandlingOptions()
-                opts.SetFailuresPreprocessor(SilentFailureHandler()) # Dimension error solver
-                t.SetFailureHandlingOptions(opts)
-                t.Start()
-                
-                # 1. Params FIRST (Sets extensions)
-                apply_params(target_el, param_dict)
+        scale = view.Scale
+        if scale <= 0:
+            return None
+        crop = view.CropBox
+        t_inv = crop.Transform.Inverse
+        local = t_inv.OfPoint(world_pt)
+        ccx = 0.5 * (crop.Min.X + crop.Max.X)
+        ccy = 0.5 * (crop.Min.Y + crop.Max.Y)
+        center = vp.GetBoxCenter()
+        return (center.X + (local.X - ccx) / scale,
+                center.Y + (local.Y - ccy) / scale)
+    except:
+        return None
+
+
+def _pick_on_paper_left_endpoint(view, old_start, old_end):
+    """Return 'start' or 'end' — whichever projects to the smaller along-axis
+    coord in this view's crop (i.e., the on-paper-left end of the beam)."""
+    try:
+        t_inv = view.CropBox.Transform.Inverse
+        ls = t_inv.OfPoint(old_start)
+        le = t_inv.OfPoint(old_end)
+        dx = abs(le.X - ls.X)
+        dy = abs(le.Y - ls.Y)
+        along_x = dx >= dy
+        sv = ls.X if along_x else ls.Y
+        ev = le.X if along_x else le.Y
+        return "start" if sv <= ev else "end"
+    except:
+        return "start"
+
+
+def capture_beam_anchor_paper(target_doc, old_start, old_end):
+    """For each viewport, pick the on-paper-left beam endpoint and snapshot its
+    paper XY. Returns {vp_id_int: (which, (x, y))}."""
+    layout = {}
+    vps = FilteredElementCollector(target_doc).OfClass(Viewport).ToElements()
+    for vp in vps:
+        try:
+            view = target_doc.GetElement(vp.ViewId)
+            if view is None or view.IsTemplate:
+                continue
+            which = _pick_on_paper_left_endpoint(view, old_start, old_end)
+            world_pt = old_start if which == "start" else old_end
+            xy = _world_pt_to_paper(vp, view, world_pt)
+            if xy is not None:
+                layout[vp.Id.IntegerValue] = (which, xy)
+        except:
+            continue
+    return layout
+
+
+def restore_beam_anchor_paper(target_doc, original_layout, new_start, new_end):
+    """Shift each viewport so the captured on-paper-left endpoint lands at the
+    same sheet XY it was at before the beam grew."""
+    vps = FilteredElementCollector(target_doc).OfClass(Viewport).ToElements()
+    shifted = 0
+    for vp in vps:
+        vid = vp.Id.IntegerValue
+        if vid not in original_layout:
+            continue
+        which, (ox, oy) = original_layout[vid]
+        world_pt = new_start if which == "start" else new_end
+        try:
+            view = target_doc.GetElement(vp.ViewId)
+            if view is None:
+                continue
+            now = _world_pt_to_paper(vp, view, world_pt)
+            if now is None:
+                continue
+            dx = ox - now[0]
+            dy = oy - now[1]
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                continue
+            center = vp.GetBoxCenter()
+            vp.SetBoxCenter(XYZ(center.X + dx, center.Y + dy, 0))
+            shifted += 1
+        except Exception as e:
+            try:
+                vn = target_doc.GetElement(vp.ViewId).Name
+            except:
+                vn = "?"
+            print("    Could not anchor viewport '{}': {}".format(vn, e))
+    print("  Anchored {} viewports by on-paper-left endpoint.".format(shifted))
+
+
+def apply_params(target_el, param_dict, target_doc):
+    written = 0
+    failed  = []
+
+    for name, (st, val) in param_dict.items():
+        tgt_p = target_el.LookupParameter(name)
+        if tgt_p is None or tgt_p.IsReadOnly:
+            continue
+        try:
+            if st == "String":
+                tgt_p.Set(str(val))
+            elif st == "Integer":
+                tgt_p.Set(int(val))
+            elif st == "Double":
+                tgt_p.Set(float(val))
+            else:
+                continue
+            written += 1
+        except:
+            failed.append((name, st, val))
+
+    if failed:
+        target_doc.Regenerate()
+        for name, st, val in failed:
+            tgt_p = target_el.LookupParameter(name)
+            if tgt_p is None or tgt_p.IsReadOnly:
+                continue
+            try:
+                if st == "String":
+                    tgt_p.Set(str(val))
+                elif st == "Integer":
+                    tgt_p.Set(int(val))
+                elif st == "Double":
+                    tgt_p.Set(float(val))
+                written += 1
+            except:
+                print("    Could not set: {}".format(name))
+
+    print("  Transferred {} parameters.".format(written))
+
+
+def apply_proj_info(single_doc, proj_data):
+    """Write project info, casting to match the target parameter's storage type."""
+    info    = single_doc.ProjectInformation
+    written = 0
+    for name, entry in proj_data.items():
+        p = info.LookupParameter(name)
+        if p is None or p.IsReadOnly:
+            print("    SKIP project info '{}' (missing or read-only)".format(name))
+            continue
+
+        if isinstance(entry, tuple):
+            src_st, val = entry
+        else:
+            src_st, val = "String", entry
+
+        target_st = str(p.StorageType)
+        try:
+            if target_st == "String":
+                p.Set(str(val))
+            elif target_st == "Integer":
+                p.Set(int(val))
+            elif target_st == "Double":
+                p.Set(float(val))
+            else:
+                print("    SKIP project info '{}' (unsupported type {})".format(name, target_st))
+                continue
+            written += 1
+        except Exception as e:
+            print("    Could not set project info '{}': {}".format(name, e))
+    print("  Transferred {} project info params.".format(written))
+
+
+def _set_sheet_param(sheet, param_name, value):
+    p = sheet.LookupParameter(param_name)
+    if p is None or p.IsReadOnly:
+        return False
+    try:
+        st = str(p.StorageType)
+        if st == "String":
+            p.Set(str(value))
+        elif st == "Double":
+            p.Set(float(value))
+        elif st == "Integer":
+            p.Set(int(value))
+        return True
+    except:
+        print("    Could not set {}".format(param_name))
+        return False
+
+
+def set_sheet_extra_params(single_doc, volume_cls, kg_totale):
+    today_str = datetime.datetime.now().strftime("%d.%m.%y")
+    sheets    = FilteredElementCollector(single_doc).OfClass(ViewSheet).ToElements()
+
+    for sheet in sheets:
+        p_date = sheet.LookupParameter("MAG_Data_Tavola")
+        if p_date and not p_date.IsReadOnly:
+            try:
+                p_date.Set(today_str)
+            except:
+                print("    Could not set MAG_Data_Tavola")
+
+        if volume_cls is not None:
+            _set_sheet_param(sheet, "MAG_Volume_CLS", volume_cls)
+
+        if kg_totale is not None:
+            _set_sheet_param(sheet, "MAG_Peso", kg_totale)
+
+
+def set_sheet_qty(single_doc, qty):
+    sheets  = FilteredElementCollector(single_doc).OfClass(ViewSheet).ToElements()
+    updated = False
+    for sheet in sheets:
+        p = sheet.LookupParameter(QTY_PARAM)
+        if p is not None and not p.IsReadOnly:
+            p.Set(qty)
+            updated = True
+    return updated
+
+
+def process_mark(mark_key, qty, param_dict, cut_length, proj_data, volume_cls, kg_totale):
+    filename = mark_key + ".rvt"
+    filepath = os.path.join(SINGLE_MODELS, filename)
+
+    if os.path.exists(filepath):
+        print("  {} already exists — opening.".format(filename))
+    else:
+        create_from_template(TEMPLATE_PATH, filepath)
+        print("  Created {} from template.".format(filename))
+
+    single_doc = None
+    t = None
+
+    try:
+        single_doc = open_document(filepath)
+
+        target_el = find_existing_beam(single_doc, FAMILY_NAME, TYPE_NAME)
+        if target_el is None:
+            print("  ERROR: No beam found in template. Skipping {}.".format(filename))
+            return
+
+        print("  Found beam instance.")
+
+        t = Transaction(single_doc, "Set Parameters & Qty")
+        opts = t.GetFailureHandlingOptions()
+        opts.SetFailuresPreprocessor(SilentFailureHandler())
+        opts.SetClearAfterRollback(True)
+        t.SetFailureHandlingOptions(opts)
+        t.Start()
+
+        if cut_length is not None:
+            try:
+                old_start, old_end = get_beam_endpoints(target_el)
+                anchor_layout = capture_beam_anchor_paper(single_doc, old_start, old_end)
+
+                set_beam_cut_length(target_el, cut_length)
                 single_doc.Regenerate()
-                
-                # 2. Geometry SECOND
-                if cut_length:
-                    old_s, old_e = target_el.Location.Curve.GetEndPoint(0), target_el.Location.Curve.GetEndPoint(1)
-                    set_beam_cut_length(target_el, cut_length)
-                    single_doc.Regenerate() # This triggers and resolves dimension errors
-                    new_s, new_e = target_el.Location.Curve.GetEndPoint(0), target_el.Location.Curve.GetEndPoint(1)
-                    reposition_tags_for_beam(single_doc, target_el, old_s, old_e, new_s, new_e)
-                    expand_view_crops_for_beam(single_doc, new_s, new_e)
-                    auto_adjust_view_scales(single_doc, cut_length)
+                new_start, new_end = get_beam_endpoints(target_el)
+                reposition_tags_for_beam(
+                    single_doc, target_el, old_start, old_end, new_start, new_end
+                )
+                fit_views_to_beam(single_doc, new_start, new_end)
+                single_doc.Regenerate()
+                restore_beam_anchor_paper(single_doc, anchor_layout, new_start, new_end)
+                single_doc.Regenerate()
+                print("  Set beam Cut Length.")
+            except Exception as e:
+                print("  WARNING: Could not set Cut Length: {}".format(e))
 
-                # 3. Project and Sheet Info
-                info = single_doc.ProjectInformation
-                for name, (st, val) in proj_data.items():
-                    p = info.LookupParameter(name)
-                    if p: p.Set(val)
-                
-                for sheet in FilteredElementCollector(single_doc).OfClass(ViewSheet).ToElements():
-                    pq = sheet.LookupParameter(QTY_PARAM)
-                    if pq: pq.Set(qty)
-                    pv = sheet.LookupParameter("MAG_Volume_CLS")
-                    if pv and vol: pv.Set(vol)
-                    pk = sheet.LookupParameter("MAG_Peso")
-                    if pk and kg: pk.Set(kg)
-                    pd = sheet.LookupParameter("MAG_Data_Tavola")
-                    if pd: pd.Set(datetime.datetime.now().strftime("%d.%m.%y"))
+        apply_params(target_el, param_dict, single_doc)
+        apply_proj_info(single_doc, proj_data)
+        set_sheet_extra_params(single_doc, volume_cls, kg_totale)
 
-                t.Commit()
-            single_doc.Save()
-            print("OK: {}".format(mark_key))
+        if set_sheet_qty(single_doc, qty):
+            print("  Set {} = {}".format(QTY_PARAM, qty))
+        else:
+            print("  WARNING: '{}' not writable on sheets.".format(QTY_PARAM))
+
+        t.Commit()
+        single_doc.Save()
+        print("  OK: {}".format(filename))
+
+    except Exception as e:
+        print("  ERROR in {}: {}".format(filename, e))
+        try:
+            if t is not None and t.HasStarted() and not t.HasEnded():
+                t.RollBack()
+        except:
+            pass
+
     finally:
-        single_doc.Close(False)
+        if single_doc is not None:
+            single_doc.Close(False)
+
+
+# ── Main ────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=== Processing Beams ===\n")
-    proj_data = read_proj_info(doc)
-    counts, reps, param_data, cut_lengths, volume_data, kg_data = collect_elements_by_mark_from_selection(doc, uidoc)
-    for key, qty in sorted(counts.items()):
-        print("Processing: {} ({} pcs)".format(key, qty))
-        process_mark(key, qty, param_data[key], cut_lengths.get(key), proj_data, volume_data.get(key), kg_data.get(key))
+    print("=== Transfer Qty & Create Shop Drawings (S beams) ===\n")
 
-if __name__ == "__main__":
-    main()
+    if not os.path.exists(TEMPLATE_PATH):
+        print("ERROR: Template not found:\n  {}".format(TEMPLATE_PATH))
+        return
+
+    proj_data = read_proj_info(doc)
+    if proj_data:
+        print("Project info from main model:")
+        for k, v in sorted(proj_data.items()):
+            print("  {} = {}".format(k, v))
+    else:
+        print("WARNING: No project info params found.")
+
+    counts, reps, param_data, cut_lengths, volume_data, kg_data = \
+        collect_elements_by_mark_from_selection(doc, uidoc)
+
+    if not counts:
+        print("No matching elements in selection.")
+        return
+
+    print("Found {} unique marks in selection:".format(len(counts)))
+    for k, v in sorted(counts.items()):
+        print("  {} = {} pcs".format(k, v))
+
+    first_key = sorted(counts.keys())[0]
+    pdata = param_data.get(first_key, {})
+    print("\nSample params read from [{}]:".format(first_key))
+    for name, (st, val) in sorted(pdata.items()):
+        if name in (PREFIX_PARAM, "Mark", "Cut Length",
+                    "Comments", "KG TOTALE Sheet - SLG22"):
+            print("  {} = {} ({})".format(name, val, st))
+    cl = cut_lengths.get(first_key)
+    if cl is not None:
+        print("  Cut Length (geometry) = {:.4f} ft".format(cl))
+    vol = volume_data.get(first_key)
+    if vol is not None:
+        print("  MC CLS Sheet - SLG22 = {}".format(vol))
+    kg = kg_data.get(first_key)
+    if kg is not None:
+        print("  KG TOTALE Sheet - SLG22 = {}".format(kg))
+
+    print("\nProcessing...\n")
+    success, skipped = 0, 0
+
+    for mark_key, qty in sorted(counts.items()):
+        print("[{}]".format(mark_key))
+        pdata = param_data.get(mark_key, {})
+        cl    = cut_lengths.get(mark_key)
+        vol   = volume_data.get(mark_key)
+        kg    = kg_data.get(mark_key)
+        if not pdata:
+            print("  SKIP: no parameter data.")
+            skipped += 1
+            continue
+        try:
+            process_mark(mark_key, qty, pdata, cl, proj_data, vol, kg)
+            success += 1
+        except Exception as e:
+            print("  FATAL: {}".format(e))
+            skipped += 1
+
+    print("\n=== Done: {} processed, {} skipped ===".format(success, skipped))
+
+main()
