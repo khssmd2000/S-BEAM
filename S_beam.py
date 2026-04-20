@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__  = "S_BEAM"
+__title__  = "TEMPLATE_S"
 __author__ = "Assem Khalelova"
 
 import os
@@ -15,7 +15,9 @@ from Autodesk.Revit.DB import (
     BuiltInParameter,
     FamilySymbol,
     FamilyInstance,
+    View,
     ViewSheet,
+    IndependentTag,
     OpenOptions,
     ModelPathUtils,
     Transaction,
@@ -313,6 +315,12 @@ def find_existing_beam(target_doc, family_name, type_name):
     return None
 
 
+def get_beam_endpoints(target_el):
+    loc   = target_el.Location
+    curve = loc.Curve
+    return curve.GetEndPoint(0), curve.GetEndPoint(1)
+
+
 def set_beam_cut_length(target_el, desired_cut_length):
     loc   = target_el.Location
     curve = loc.Curve
@@ -333,6 +341,74 @@ def set_beam_cut_length(target_el, desired_cut_length):
     new_end  = start + direction.Multiply(needed_curve_length)
     new_line = Line.CreateBound(start, new_end)
     loc.Curve = new_line
+
+
+def reposition_tags_for_beam(target_doc, target_el, old_start, old_end, new_start, new_end):
+    """
+    Reproject each tag head onto the new beam axis: preserve the perpendicular
+    offset, scale the along-axis distance by (new_length / old_length).
+    """
+    old_len = old_end.DistanceTo(old_start)
+    new_len = new_end.DistanceTo(new_start)
+    if old_len < 1e-9 or new_len < 1e-9:
+        return
+
+    old_axis = (old_end - old_start).Normalize()
+    new_axis = (new_end - new_start).Normalize()
+    scale    = new_len / old_len
+
+    target_int = target_el.Id.IntegerValue
+    all_views  = FilteredElementCollector(target_doc).OfClass(View).ToElements()
+
+    moved   = 0
+    scanned = 0
+    for view in all_views:
+        try:
+            if view.IsTemplate:
+                continue
+        except:
+            continue
+
+        try:
+            tags = FilteredElementCollector(target_doc, view.Id)\
+                .OfClass(IndependentTag)\
+                .ToElements()
+        except:
+            continue
+
+        for tag in tags:
+            scanned += 1
+            try:
+                tagged_ids = list(tag.GetTaggedLocalElementIds())
+            except:
+                tagged_ids = []
+
+            hits = False
+            for tid in tagged_ids:
+                try:
+                    if tid.IntegerValue == target_int:
+                        hits = True
+                        break
+                except:
+                    continue
+            if not hits:
+                continue
+
+            try:
+                head   = tag.TagHeadPosition
+                offset = head - old_start
+                along  = offset.DotProduct(old_axis)
+                perp   = offset - old_axis.Multiply(along)
+
+                new_along = along * scale
+                new_head  = new_start + new_axis.Multiply(new_along) + perp
+
+                tag.TagHeadPosition = new_head
+                moved += 1
+            except Exception as e:
+                print("    Could not move tag {}: {}".format(tag.Id, e))
+
+    print("  Scanned {} tags, repositioned {}.".format(scanned, moved))
 
 
 def apply_params(target_el, param_dict, target_doc):
@@ -488,7 +564,13 @@ def process_mark(mark_key, qty, param_dict, cut_length, proj_data, volume_cls, k
 
         if cut_length is not None:
             try:
+                old_start, old_end = get_beam_endpoints(target_el)
                 set_beam_cut_length(target_el, cut_length)
+                single_doc.Regenerate()
+                new_start, new_end = get_beam_endpoints(target_el)
+                reposition_tags_for_beam(
+                    single_doc, target_el, old_start, old_end, new_start, new_end
+                )
                 single_doc.Regenerate()
                 print("  Set beam Cut Length.")
             except Exception as e:
