@@ -37,10 +37,10 @@ uidoc = __revit__.ActiveUIDocument
 doc   = uidoc.Document
 
 # TODO: fill in S beam family name, type name, template path and output folder
-FAMILY_NAME   = "TODO_S_BEAM_FAMILY_NAME"
-TYPE_NAME     = "TODO_S_BEAM_TYPE_NAME"
-SINGLE_MODELS = r"TODO_S_BEAM_SINGLE_MODELS_FOLDER"
-TEMPLATE_PATH = r"TODO_S_BEAM_TEMPLATE_PATH"
+FAMILY_NAME   = "MAG_S_B_50_SLG23_KLZ_B.rfa"
+TYPE_NAME     = "S120B"
+SINGLE_MODELS = r"X:\01_PROJECTS\01_ITALY\01_MAGNETTI\MG-2608-SD-AKNO FIORENZUOLA\04_Designs\3_SD_Structure\2_Beams"
+TEMPLATE_PATH = r"X:\01_PROJECTS\01_ITALY\01_MAGNETTI\MG-2608-SD-AKNO FIORENZUOLA\05_Model\Template\S_template.rvt"
 QTY_PARAM     = "MAG_Conteggio"
 PREFIX_PARAM  = "Prefix_Mark"
 
