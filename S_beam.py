@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__  = "TEMPLATE_S_beam3"
+__title__  = "TEMPLATE_S_beamm_fin"
 __author__ = "Assem Khalelova"
 
 import os
@@ -46,10 +46,11 @@ TEMPLATE_PATH = r"X:\01_PROJECTS\01_ITALY\01_MAGNETTI\MG-2608-SD-AKNO FIORENZUOL
 QTY_PARAM     = "MAG_Conteggio"
 PREFIX_PARAM  = "Prefix_Mark"
 
-# Crop + scale tuning — adjust for your sheet/title-block layout
-CROP_MARGIN_FT          = 1.0    # extra space around beam inside the crop (~30 cm)
-MAX_VIEWPORT_WIDTH_MM   = 240.0  # strict paper-width budget for main views
-MAX_VIEWPORT_HEIGHT_MM  = 200.0  # (unused by fit_views_to_beam; kept for reference)
+# Sheet A3: 420 x 297 mm. Right side of sheet is occupied by title block +
+# "POSIZIONE INSERTI" detail + notes. Budget is the paper width available for
+# the main-view viewport before it would overlap those. Tune if needed.
+CROP_MARGIN_FT          = 1.0    # margin added to each end of beam inside crop (~30 cm)
+MAX_VIEWPORT_WIDTH_MM   = 300.0  # beam's on-paper length must fit in this
 VIEW_PARALLEL_DOT       = 0.85   # |dot(view_dir, beam_axis)| above this = cross-section
 VIEW_SCALES             = [10, 20, 25, 50, 75, 100, 125, 150, 200, 250, 500]
 
@@ -347,6 +348,7 @@ def set_beam_cut_length(target_el, desired_cut_length):
         end_ext = ee_p.AsDouble()
 
     needed_curve_length = desired_cut_length - start_ext - end_ext
+    # Keep endpoint(0) fixed — beam grows from start toward the right (endpoint(1) moves).
     new_end  = start + direction.Multiply(needed_curve_length)
     new_line = Line.CreateBound(start, new_end)
     loc.Curve = new_line
@@ -420,29 +422,9 @@ def reposition_tags_for_beam(target_doc, target_el, old_start, old_end, new_star
     print("  Scanned {} tags, repositioned {}.".format(scanned, moved))
 
 
-def fit_views_to_beam(target_doc, beam_start, beam_end,
-                      max_w_mm=MAX_VIEWPORT_WIDTH_MM,
-                      margin_ft=CROP_MARGIN_FT,
-                      allowed_scales=VIEW_SCALES,
-                      parallel_dot=VIEW_PARALLEL_DOT):
-    """
-    For each non-template view with an active crop:
-      - if ViewDirection is ~parallel to the beam axis → cross-section, skip.
-      - otherwise: pick the smallest scale from allowed_scales that makes the
-        beam's projected length fit max_w_mm of paper; set view.Scale; then
-        rebuild the crop tight around the beam + margin on both axes.
-    """
-    max_w_ft = max_w_mm / 304.8
-
-    beam_vec = beam_end - beam_start
-    beam_len = beam_vec.GetLength()
-    if beam_len < 1e-9:
-        print("  fit_views_to_beam: beam length is zero, skipped.")
-        return
-    beam_axis = beam_vec.Normalize()
-
-    # Collect only views placed on a sheet as viewports — drafting templates,
-    # legends etc. are irrelevant and just add noise.
+def _collect_main_views_on_sheet(target_doc, beam_axis, parallel_dot):
+    """Return list of (view, along_is_x) for each non-cross-section view that's
+    placed on a sheet via a Viewport."""
     vps = FilteredElementCollector(target_doc).OfClass(Viewport).ToElements()
     sheet_view_ids = set()
     for vp in vps:
@@ -451,70 +433,104 @@ def fit_views_to_beam(target_doc, beam_start, beam_end,
         except:
             pass
 
-    views = FilteredElementCollector(target_doc).OfClass(View).ToElements()
-
-    fitted      = 0
-    skipped_cx  = 0
-    skipped_oth = 0
-
+    views  = FilteredElementCollector(target_doc).OfClass(View).ToElements()
+    result = []
     for view in views:
         try:
-            if view.IsTemplate:
+            if view.IsTemplate or view.Id.IntegerValue not in sheet_view_ids:
                 continue
-            if view.Id.IntegerValue not in sheet_view_ids:
-                continue
+            vd = view.ViewDirection.Normalize()
         except:
             continue
+        dp = abs(vd.X * beam_axis.X + vd.Y * beam_axis.Y + vd.Z * beam_axis.Z)
+        if dp > parallel_dot:
+            continue
+        result.append((view, dp))
+    return result
 
+
+
+def expand_crop_right_for_beam(target_doc, target_el, beam_start, beam_end,
+                               margin_ft=CROP_MARGIN_FT,
+                               parallel_dot=VIEW_PARALLEL_DOT):
+    """
+    For each main view on a sheet: ask Revit for the beam's bounding box IN
+    that view's own coordinate system (get_BoundingBox), then compare directly
+    with crop.Max.X — same coordinate system, no transforms needed.
+    Forces CropBoxVisible = False after any change.
+    """
+    bvec = beam_end - beam_start
+    if bvec.GetLength() < 1e-9:
+        return
+    baxis = bvec.Normalize()
+
+    main_views = _collect_main_views_on_sheet(target_doc, baxis, parallel_dot)
+
+    for view, dp in main_views:
+        try:
+            vn = view.Name
+        except:
+            vn = "?"
+        try:
+            crop = view.CropBox
+
+            # Beam extent in this view's local coordinate system
+            bb = target_el.get_BoundingBox(view)
+            if bb is None:
+                continue
+
+            # bb.Max.X == beam's rightmost local X  (same system as crop.Max.X)
+            needed_max_x = bb.Max.X + margin_ft
+            if needed_max_x <= crop.Max.X:
+                continue  # beam already fits within crop
+
+            new_box           = BoundingBoxXYZ()
+            new_box.Transform = crop.Transform
+            new_box.Min       = crop.Min
+            new_box.Max       = XYZ(needed_max_x, crop.Max.Y, crop.Max.Z)
+            view.CropBox        = new_box
+            view.CropBoxVisible = False
+            print("  Crop right expanded for '{}' ({:.3f} -> {:.3f} ft local).".format(
+                vn, crop.Max.X, needed_max_x))
+        except Exception as e:
+            print("  Could not expand crop for '{}': {}".format(vn, e))
+
+
+def fit_scales_only(target_doc, beam_start, beam_end,
+                    max_w_mm=MAX_VIEWPORT_WIDTH_MM,
+                    allowed_scales=VIEW_SCALES,
+                    parallel_dot=VIEW_PARALLEL_DOT):
+    """
+    For each main view on a sheet (not a cross-section): if the beam's
+    projected length on paper at the current scale exceeds max_w_mm, bump
+    view.Scale up the ladder. Does NOT touch crop boxes.
+    Returns list of warning strings for views that couldn't be fixed.
+    """
+    import math
+
+    max_w_ft = max_w_mm / 304.8
+    bvec = beam_end - beam_start
+    blen = bvec.GetLength()
+    if blen < 1e-9:
+        return []
+    baxis = bvec.Normalize()
+
+    main_views = _collect_main_views_on_sheet(target_doc, baxis, parallel_dot)
+    rescaled = 0
+    warnings = []
+
+    for view, dp in main_views:
         try:
             vn = view.Name
         except:
             vn = "?"
 
-        try:
-            vd = view.ViewDirection.Normalize()
-        except:
-            print("    '{}' has no ViewDirection, skipped.".format(vn))
-            skipped_oth += 1
+        in_plane = blen * math.sqrt(max(0.0, 1.0 - dp * dp))
+        if in_plane < 0.01:
             continue
-
-        dp = abs(vd.X * beam_axis.X + vd.Y * beam_axis.Y + vd.Z * beam_axis.Z)
-        print("    '{}': dot={:.2f}, scale=1:{}, cropActive={}".format(
-            vn, dp, view.Scale, view.CropBoxActive))
-
-        if dp > parallel_dot:
-            skipped_cx += 1
-            continue
-
-        # Force crop ON so our bounds actually clip the view.
-        if not view.CropBoxActive:
-            try:
-                view.CropBoxActive = True
-                view.CropBoxVisible = False
-            except:
-                pass
-
-        crop = view.CropBox
-        try:
-            t_inv = crop.Transform.Inverse
-        except:
-            print("    '{}': crop transform not invertible, skipped.".format(vn))
-            continue
-
-        p_start = t_inv.OfPoint(beam_start)
-        p_end   = t_inv.OfPoint(beam_end)
-
-        dx = abs(p_end.X - p_start.X)
-        dy = abs(p_end.Y - p_start.Y)
-        if max(dx, dy) < 0.01:
-            print("    '{}': beam projection ~zero in view plane, skipped.".format(vn))
-            continue
-
-        along_is_x   = dx >= dy
-        in_plane_len = dx if along_is_x else dy
 
         current_scale = view.Scale
-        required      = in_plane_len / max_w_ft if max_w_ft > 0 else current_scale
+        required = in_plane / max_w_ft if max_w_ft > 0 else current_scale
 
         target_s = None
         for s in allowed_scales:
@@ -523,138 +539,23 @@ def fit_views_to_beam(target_doc, beam_start, beam_end,
                 break
 
         if target_s is None:
-            print("    '{}' needs scale > {:.0f} — none in allowed list.".format(
-                vn, required))
-            target_s = current_scale
+            msg = "'{}' needs scale > {:.0f} — not in allowed list".format(vn, required)
+            warnings.append(msg)
+            print("  SCALE WARNING: " + msg)
+            continue
 
         if target_s != current_scale:
             try:
                 view.Scale = target_s
-                print("  Scale: '{}' 1:{} -> 1:{}".format(vn, current_scale, target_s))
+                print("  Scale: '{}' 1:{} -> 1:{}.".format(vn, current_scale, target_s))
+                rescaled += 1
             except Exception as e:
-                print("    Could not rescale '{}' (template may lock Scale): {}".format(vn, e))
+                msg = "Could not rescale '{}': {}".format(vn, e)
+                warnings.append(msg)
+                print("  SCALE WARNING: " + msg)
 
-        # Tight crop on BOTH axes — discard the old extent so nothing stays oversized.
-        a_start, a_end = (p_start.X, p_end.X) if along_is_x else (p_start.Y, p_end.Y)
-        o_start, o_end = (p_start.Y, p_end.Y) if along_is_x else (p_start.X, p_end.X)
-
-        a_min = min(a_start, a_end) - margin_ft
-        a_max = max(a_start, a_end) + margin_ft
-        o_min = min(o_start, o_end) - margin_ft
-        o_max = max(o_start, o_end) + margin_ft
-
-        if along_is_x:
-            new_min = XYZ(a_min, o_min, crop.Min.Z)
-            new_max = XYZ(a_max, o_max, crop.Max.Z)
-        else:
-            new_min = XYZ(o_min, a_min, crop.Min.Z)
-            new_max = XYZ(o_max, a_max, crop.Max.Z)
-
-        new_bbox = BoundingBoxXYZ()
-        new_bbox.Transform = crop.Transform
-        new_bbox.Min = new_min
-        new_bbox.Max = new_max
-
-        try:
-            view.CropBox = new_bbox
-            fitted += 1
-        except Exception as e:
-            print("    Could not resize crop on '{}': {}".format(vn, e))
-
-    print("  Fitted {} views (skipped {} cross-sections, {} other).".format(
-        fitted, skipped_cx, skipped_oth))
-
-
-def _world_pt_to_paper(vp, view, world_pt):
-    """
-    Paper-space XY where world_pt falls inside this viewport's area on the sheet.
-    paper = vp_center + (point_in_crop_local - crop_center_local) / view.Scale
-    """
-    try:
-        scale = view.Scale
-        if scale <= 0:
-            return None
-        crop = view.CropBox
-        t_inv = crop.Transform.Inverse
-        local = t_inv.OfPoint(world_pt)
-        ccx = 0.5 * (crop.Min.X + crop.Max.X)
-        ccy = 0.5 * (crop.Min.Y + crop.Max.Y)
-        center = vp.GetBoxCenter()
-        return (center.X + (local.X - ccx) / scale,
-                center.Y + (local.Y - ccy) / scale)
-    except:
-        return None
-
-
-def _pick_on_paper_left_endpoint(view, old_start, old_end):
-    """Return 'start' or 'end' — whichever projects to the smaller along-axis
-    coord in this view's crop (i.e., the on-paper-left end of the beam)."""
-    try:
-        t_inv = view.CropBox.Transform.Inverse
-        ls = t_inv.OfPoint(old_start)
-        le = t_inv.OfPoint(old_end)
-        dx = abs(le.X - ls.X)
-        dy = abs(le.Y - ls.Y)
-        along_x = dx >= dy
-        sv = ls.X if along_x else ls.Y
-        ev = le.X if along_x else le.Y
-        return "start" if sv <= ev else "end"
-    except:
-        return "start"
-
-
-def capture_beam_anchor_paper(target_doc, old_start, old_end):
-    """For each viewport, pick the on-paper-left beam endpoint and snapshot its
-    paper XY. Returns {vp_id_int: (which, (x, y))}."""
-    layout = {}
-    vps = FilteredElementCollector(target_doc).OfClass(Viewport).ToElements()
-    for vp in vps:
-        try:
-            view = target_doc.GetElement(vp.ViewId)
-            if view is None or view.IsTemplate:
-                continue
-            which = _pick_on_paper_left_endpoint(view, old_start, old_end)
-            world_pt = old_start if which == "start" else old_end
-            xy = _world_pt_to_paper(vp, view, world_pt)
-            if xy is not None:
-                layout[vp.Id.IntegerValue] = (which, xy)
-        except:
-            continue
-    return layout
-
-
-def restore_beam_anchor_paper(target_doc, original_layout, new_start, new_end):
-    """Shift each viewport so the captured on-paper-left endpoint lands at the
-    same sheet XY it was at before the beam grew."""
-    vps = FilteredElementCollector(target_doc).OfClass(Viewport).ToElements()
-    shifted = 0
-    for vp in vps:
-        vid = vp.Id.IntegerValue
-        if vid not in original_layout:
-            continue
-        which, (ox, oy) = original_layout[vid]
-        world_pt = new_start if which == "start" else new_end
-        try:
-            view = target_doc.GetElement(vp.ViewId)
-            if view is None:
-                continue
-            now = _world_pt_to_paper(vp, view, world_pt)
-            if now is None:
-                continue
-            dx = ox - now[0]
-            dy = oy - now[1]
-            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
-                continue
-            center = vp.GetBoxCenter()
-            vp.SetBoxCenter(XYZ(center.X + dx, center.Y + dy, 0))
-            shifted += 1
-        except Exception as e:
-            try:
-                vn = target_doc.GetElement(vp.ViewId).Name
-            except:
-                vn = "?"
-            print("    Could not anchor viewport '{}': {}".format(vn, e))
-    print("  Anchored {} viewports by on-paper-left endpoint.".format(shifted))
+    print("  Rescaled {} of {} main views.".format(rescaled, len(main_views)))
+    return warnings
 
 
 def apply_params(target_el, param_dict, target_doc):
@@ -808,20 +709,26 @@ def process_mark(mark_key, qty, param_dict, cut_length, proj_data, volume_cls, k
         t.SetFailureHandlingOptions(opts)
         t.Start()
 
+        scale_warnings = []
         if cut_length is not None:
             try:
                 old_start, old_end = get_beam_endpoints(target_el)
-                anchor_layout = capture_beam_anchor_paper(single_doc, old_start, old_end)
-
                 set_beam_cut_length(target_el, cut_length)
                 single_doc.Regenerate()
                 new_start, new_end = get_beam_endpoints(target_el)
                 reposition_tags_for_beam(
                     single_doc, target_el, old_start, old_end, new_start, new_end
                 )
-                fit_views_to_beam(single_doc, new_start, new_end)
+                expand_crop_right_for_beam(single_doc, target_el, new_start, new_end)
                 single_doc.Regenerate()
-                restore_beam_anchor_paper(single_doc, anchor_layout, new_start, new_end)
+                # Revit can re-enable CropBoxVisible on Regenerate; force off again
+                for _v in FilteredElementCollector(single_doc).OfClass(View).ToElements():
+                    try:
+                        if not _v.IsTemplate and _v.CropBoxVisible:
+                            _v.CropBoxVisible = False
+                    except:
+                        pass
+                scale_warnings = fit_scales_only(single_doc, new_start, new_end)
                 single_doc.Regenerate()
                 print("  Set beam Cut Length.")
             except Exception as e:
@@ -836,9 +743,18 @@ def process_mark(mark_key, qty, param_dict, cut_length, proj_data, volume_cls, k
         else:
             print("  WARNING: '{}' not writable on sheets.".format(QTY_PARAM))
 
+        # Final sweep: ensure no crop box frames became visible during processing
+        for _v in FilteredElementCollector(single_doc).OfClass(View).ToElements():
+            try:
+                if not _v.IsTemplate and _v.CropBoxVisible:
+                    _v.CropBoxVisible = False
+            except:
+                pass
+
         t.Commit()
         single_doc.Save()
         print("  OK: {}".format(filename))
+        return scale_warnings
 
     except Exception as e:
         print("  ERROR in {}: {}".format(filename, e))
@@ -851,6 +767,8 @@ def process_mark(mark_key, qty, param_dict, cut_length, proj_data, volume_cls, k
     finally:
         if single_doc is not None:
             single_doc.Close(False)
+
+    return []
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
@@ -900,6 +818,7 @@ def main():
 
     print("\nProcessing...\n")
     success, skipped = 0, 0
+    all_scale_warnings = []
 
     for mark_key, qty in sorted(counts.items()):
         print("[{}]".format(mark_key))
@@ -912,12 +831,21 @@ def main():
             skipped += 1
             continue
         try:
-            process_mark(mark_key, qty, pdata, cl, proj_data, vol, kg)
+            warns = process_mark(mark_key, qty, pdata, cl, proj_data, vol, kg)
+            if warns:
+                for w in warns:
+                    all_scale_warnings.append("[{}] {}".format(mark_key, w.strip()))
             success += 1
         except Exception as e:
             print("  FATAL: {}".format(e))
             skipped += 1
 
     print("\n=== Done: {} processed, {} skipped ===".format(success, skipped))
+
+    if all_scale_warnings:
+        print("\n=== SCALE WARNINGS — beam may overlap sheet content ===")
+        for w in all_scale_warnings:
+            print("  " + w)
+        print("  -> Adjust scale manually in the affected files.")
 
 main()
